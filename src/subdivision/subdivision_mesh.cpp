@@ -1,3 +1,4 @@
+
 #include "subdivision_mesh.hpp"
 
 #include "godot_cpp/classes/mesh_instance3d.hpp"
@@ -15,21 +16,15 @@
 #include "quad_subdivider.hpp"
 #include "triangle_subdivider.hpp"
 
-Array SubdivisionMesh::_get_subdivided_arrays(const Array &p_arrays, int p_level, int32_t p_format, bool calculate_normals, TopologyDataMesh::TopologyType topology_type) {
-	const PackedVector3Array &vertex_array = p_arrays[TopologyDataMesh::ARRAY_VERTEX];
-	if (vertex_array.is_empty()) {
-		Array empty_surface;
-		empty_surface.resize(Mesh::ARRAY_MAX);
-		return empty_surface;
-	}
+Array SubdivisionMesh::_get_subdivided_arrays(const Array &p_arrays, int p_level, int32_t p_format, bool calculate_normals, int topology_type) {
 	switch (topology_type) {
-		case TopologyDataMesh::QUAD: {
+		case TopologyDataMesh::TOPOLOGY_DATA_MESH_QUAD: {
 			Ref<QuadSubdivider> subdivider;
 			subdivider.instantiate();
 			return subdivider->get_subdivided_arrays(p_arrays, p_level, p_format, calculate_normals);
 		}
 
-		case TopologyDataMesh::TRIANGLE: {
+		case TopologyDataMesh::TOPOLOGY_DATA_MESH_TRIANGLE: {
 			Ref<TriangleSubdivider> subdivider;
 			subdivider.instantiate();
 			return subdivider->get_subdivided_arrays(p_arrays, p_level, p_format, calculate_normals);
@@ -45,7 +40,7 @@ void SubdivisionMesh::update_subdivision(Ref<TopologyDataMesh> p_mesh, int32_t p
 }
 //just leave cached data arrays empty if you want to use p_mesh arrays
 void SubdivisionMesh::_update_subdivision(Ref<TopologyDataMesh> p_mesh, int32_t p_level, const Vector<Array> &cached_data_arrays) {
-	subdiv_mesh->clear_surfaces();
+	RenderingServer::get_singleton()->mesh_clear(subdiv_mesh);
 	subdiv_vertex_count.clear();
 	subdiv_index_count.clear();
 
@@ -62,16 +57,19 @@ void SubdivisionMesh::_update_subdivision(Ref<TopologyDataMesh> p_mesh, int32_t 
 
 		Array v_arrays = cached_data_arrays.size() ? cached_data_arrays[surface_index]
 												   : p_mesh->surface_get_arrays(surface_index);
+
 		Array subdiv_triangle_arrays = _get_subdivided_arrays(v_arrays, p_level, surface_format, true, p_mesh->surface_get_topology_type(surface_index));
 
+		rendering_server->mesh_add_surface_from_arrays(subdiv_mesh, RenderingServer::PRIMITIVE_TRIANGLES, subdiv_triangle_arrays, Array(), Dictionary(), surface_format);
+
 		Ref<Material> material = p_mesh->surface_get_material(surface_index);
-		subdiv_mesh->add_surface(subdiv_triangle_arrays, Dictionary(), material, "", surface_format);
+		rendering_server->mesh_surface_set_material(subdiv_mesh, surface_index, material.is_null() ? RID() : material->get_rid());
+		current_level = p_level;
 	}
-	current_level = p_level;
 }
 
 void SubdivisionMesh::update_subdivision_vertices(int p_surface, const PackedVector3Array &new_vertex_array,
-		const PackedInt32Array &index_array, TopologyDataMesh::TopologyType topology_type) {
+		const PackedInt32Array &index_array, int topology_type) {
 	int p_level = current_level;
 	ERR_FAIL_COND(p_level < 0);
 
@@ -84,14 +82,35 @@ void SubdivisionMesh::update_subdivision_vertices(int p_surface, const PackedVec
 	v_arrays[TopologyDataMesh::ARRAY_INDEX] = index_array;
 
 	//TODO: also update normals
+	// for putting it into an int look in immediate mesh (just shift and clamp each value to fit into 30 bits total)
 	// currently normal generation too slow to actually update
 	Array subdiv_triangle_arrays = _get_subdivided_arrays(v_arrays, p_level, surface_format, false, topology_type);
 
-	subdiv_mesh->update_surface_vertices(p_surface, subdiv_triangle_arrays);
+	const PackedVector3Array &vertex_array_out = subdiv_triangle_arrays[Mesh::ARRAY_VERTEX]; //now that subdivider class used this is the already triangulated array
+
+	// update vertices
+	//Vector<uint8_t> vertex_data; // Vertex, Normal, Tangent (change with skinning, blendshape).
+	godot::Dictionary sd = RenderingServer::get_singleton()->mesh_get_surface(subdiv_mesh, p_surface);
+	PackedByteArray vertex_buffer = sd.get("vertex_data", PackedByteArray());
+	uint8_t *vertex_write_buffer = vertex_buffer.ptrw();
+
+	uint32_t vertex_stride = sizeof(float) * 3; //vector3 size
+
+	if (vertex_buffer.size() / (int64_t)vertex_stride != vertex_array_out.size() && vertex_buffer.size() % vertex_array_out.size() == 0) {
+		vertex_stride = vertex_buffer.size() / vertex_array_out.size(); //if not already equal likely also contains normals and/or tangents
+		//if the division has a remainder data corrupted, will then autofail in condition below
+	}
+	ERR_FAIL_COND(vertex_buffer.size() / (int64_t)vertex_stride != vertex_array_out.size());
+
+	for (int vertex_index = 0; vertex_index < vertex_array_out.size(); vertex_index++) {
+		memcpy(&vertex_write_buffer[vertex_index * vertex_stride], &vertex_array_out[vertex_index], sizeof(float) * 3);
+	}
+
+	RenderingServer::get_singleton()->mesh_surface_update_vertex_region(subdiv_mesh, p_surface, 0, vertex_buffer);
 }
 
 void SubdivisionMesh::clear() {
-	subdiv_mesh->clear_surfaces();
+	RenderingServer::get_singleton()->mesh_clear(subdiv_mesh);
 	subdiv_vertex_count.clear();
 	subdiv_index_count.clear();
 }
@@ -107,18 +126,32 @@ int64_t SubdivisionMesh::surface_get_index_array_size(int p_surface) const {
 }
 
 RID SubdivisionMesh::get_rid() const {
-	return subdiv_mesh->get_rid();
+	return subdiv_mesh;
+}
+
+void SubdivisionMesh::set_rid(RID p_rid) {
+	// TODO: THIS CODE IS FUUCKED
+	// if (subdiv_mesh.is_valid()) {
+	// 	RenderingServer::get_singleton()->free(subdiv_mesh);
+	// }
+	subdiv_mesh = p_rid;
 }
 
 void SubdivisionMesh::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_rid"), &SubdivisionMesh::get_rid);
-	ClassDB::bind_method(D_METHOD("update_subdivision"), &SubdivisionMesh::update_subdivision);
+	ClassDB::bind_method(D_METHOD("update_subdivision", "mesh", "level"), &SubdivisionMesh::update_subdivision);
 }
 
 SubdivisionMesh::SubdivisionMesh() {
-	subdiv_mesh.instantiate();
 	current_level = 0;
+	subdiv_mesh = RenderingServer::get_singleton()->mesh_create();
 }
 
 SubdivisionMesh::~SubdivisionMesh() {
+	// TODO: UNFUCK
+	// if (subdiv_mesh.is_valid()) {
+	// 	RenderingServer::get_singleton()->free(subdiv_mesh);
+	// }
+
+	subdiv_mesh = RID();
 }

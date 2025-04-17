@@ -1,17 +1,18 @@
 #include "subdivision_baker.hpp"
 #include "godot_cpp/variant/utility_functions.hpp"
+
 #include "quad_subdivider.hpp"
 #include "triangle_subdivider.hpp"
 
-Array SubdivisionBaker::get_baked_arrays(const Array &topology_arrays, int p_level, int64_t p_format, TopologyDataMesh::TopologyType topology_type) {
+Array SubdivisionBaker::get_baked_arrays(const Array &topology_arrays, int p_level, int64_t p_format, int topology_type) {
 	switch (topology_type) {
-		case TopologyDataMesh::QUAD: {
+		case TopologyDataMesh::TOPOLOGY_DATA_MESH_QUAD: {
 			Ref<QuadSubdivider> subdivider;
 			subdivider.instantiate();
 			return subdivider->get_subdivided_arrays(topology_arrays, p_level, p_format, true);
 		}
 
-		case TopologyDataMesh::TRIANGLE: {
+		case TopologyDataMesh::TOPOLOGY_DATA_MESH_TRIANGLE: {
 			Ref<TriangleSubdivider> subdivider;
 			subdivider.instantiate();
 			return subdivider->get_subdivided_arrays(topology_arrays, p_level, p_format, true);
@@ -23,7 +24,7 @@ Array SubdivisionBaker::get_baked_arrays(const Array &topology_arrays, int p_lev
 }
 
 TypedArray<Array> SubdivisionBaker::get_baked_blend_shape_arrays(const Array &base_arrays, const Array &relative_topology_blend_shape_arrays,
-		int32_t p_level, int64_t p_format, TopologyDataMesh::TopologyType topology_type) {
+		int32_t p_level, int64_t p_format, int topology_type) {
 	Array blend_shape_arrays = base_arrays.duplicate(false);
 	p_format &= ~Mesh::ARRAY_FORMAT_BONES;
 	p_format &= ~Mesh::ARRAY_FORMAT_WEIGHTS;
@@ -55,7 +56,7 @@ TypedArray<Array> SubdivisionBaker::get_baked_blend_shape_arrays(const Array &ba
 
 Ref<ImporterMesh> SubdivisionBaker::get_importer_mesh(const Ref<ImporterMesh> &p_base, const Ref<TopologyDataMesh> &p_topology_data_mesh, int32_t p_level, bool bake_blendshapes) {
 	Ref<ImporterMesh> mesh;
-	if (!p_base.is_null()) {
+	if (p_base.is_valid()) {
 		mesh = p_base;
 	}
 	if (mesh.is_null()) {
@@ -71,7 +72,7 @@ Ref<ImporterMesh> SubdivisionBaker::get_importer_mesh(const Ref<ImporterMesh> &p
 	for (int surface_index = 0; surface_index < p_topology_data_mesh->get_surface_count(); surface_index++) {
 		const Array &source_arrays = p_topology_data_mesh->surface_get_arrays(surface_index);
 		int64_t p_format = p_topology_data_mesh->surface_get_format(surface_index);
-		TopologyDataMesh::TopologyType topology_type = p_topology_data_mesh->surface_get_topology_type(surface_index);
+		int topology_type = p_topology_data_mesh->surface_get_topology_type(surface_index);
 		const String &surface_name = p_topology_data_mesh->surface_get_name(surface_index);
 		const Ref<Material> &surface_material = p_topology_data_mesh->surface_get_material(surface_index);
 
@@ -83,32 +84,15 @@ Ref<ImporterMesh> SubdivisionBaker::get_importer_mesh(const Ref<ImporterMesh> &p
 					p_level, p_format, topology_type);
 		}
 
-		mesh->add_surface(Mesh::PRIMITIVE_TRIANGLES, surface_baked_arrays, baked_blend_shape_arrays, Dictionary(), surface_material, surface_name, 0);
+		mesh->add_surface(Mesh::PRIMITIVE_TRIANGLES, surface_baked_arrays, baked_blend_shape_arrays, Dictionary(), surface_material, surface_name, p_format);
 	}
 
 	return mesh;
 }
 
-Ref<ArrayMesh> SubdivisionBaker::get_array_mesh(const Ref<ArrayMesh> &p_base, const Ref<TopologyDataMesh> &p_topology_data_mesh, int32_t p_level, bool generate_lods, bool bake_blendshapes) {
-	Ref<ArrayMesh> mesh;
-	Ref<ImporterMesh> importer_mesh;
-	if (!p_base.is_null()) {
-		mesh = p_base;
-	}
-	if (mesh.is_null()) {
-		mesh.instantiate();
-	}
-
-	importer_mesh = get_importer_mesh(importer_mesh, p_topology_data_mesh, p_level, bake_blendshapes);
-	if (generate_lods) {
-		importer_mesh->generate_lods(UtilityFunctions::deg_to_rad(25), UtilityFunctions::deg_to_rad(60), Array());
-	}
-	mesh = importer_mesh->get_mesh(mesh);
-	return mesh;
-}
+SubdivisionBaker::SubdivisionBaker() {}
+SubdivisionBaker::~SubdivisionBaker() {}
 
 void SubdivisionBaker::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_baked_arrays", "topology_arrays", "subdivision_level", "format", "topology_type"), &SubdivisionBaker::get_baked_arrays);
-	ClassDB::bind_method(D_METHOD("get_importer_mesh", "base", "topology_data_mesh", "subdivision_level"), &SubdivisionBaker::get_importer_mesh);
-	ClassDB::bind_method(D_METHOD("get_array_mesh", "base", "topology_data_mesh", "subdivision_level", "generate_lods"), &SubdivisionBaker::get_array_mesh);
 }

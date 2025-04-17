@@ -1,4 +1,6 @@
 #include "topology_data_importer.hpp"
+#include "resources/baked_subdiv_mesh.hpp"
+#include "subdivision/subdivision_baker.hpp"
 
 #include "godot_cpp/templates/hash_map.hpp"
 #include "godot_cpp/templates/hash_set.hpp"
@@ -10,16 +12,19 @@
 #include "godot_cpp/classes/scene_tree.hpp"
 #include "godot_cpp/classes/skeleton3d.hpp"
 #include "godot_cpp/variant/utility_functions.hpp"
+#include "godot_cpp/classes/skin.hpp"
 
-#include "nodes/subdiv_mesh_instance_3d.hpp"
-#include "resources/baked_subdiv_mesh.hpp"
-#include "subdivision/subdivision_baker.hpp"
+using namespace godot;
+
+TopologyDataImporter::TopologyDataImporter() {
+}
+
+TopologyDataImporter::~TopologyDataImporter() {
+}
 
 void TopologyDataImporter::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("convert_importer_meshinstance_to_subdiv"), &TopologyDataImporter::convert_importer_meshinstance_to_subdiv);
-	BIND_ENUM_CONSTANT(SUBDIV_MESHINSTANCE);
+	ClassDB::bind_method(D_METHOD("convert_importer_meshinstance_to_subdiv", "object", "mode", "level"), &TopologyDataImporter::convert_importer_meshinstance_to_subdiv);
 	BIND_ENUM_CONSTANT(BAKED_SUBDIV_MESH);
-	BIND_ENUM_CONSTANT(ARRAY_MESH);
 	BIND_ENUM_CONSTANT(IMPORTER_MESH)
 }
 
@@ -27,37 +32,18 @@ TopologyDataImporter::SurfaceVertexArrays::SurfaceVertexArrays(const Array &p_me
 	ERR_FAIL_COND(p_mesh_arrays.size() != Mesh::ARRAY_MAX);
 
 	vertex_array = p_mesh_arrays[Mesh::ARRAY_VERTEX];
-	if (p_mesh_arrays[Mesh::ARRAY_NORMAL].get_type() == Variant::PACKED_VECTOR3_ARRAY)
-		normal_array = p_mesh_arrays[Mesh::ARRAY_NORMAL];
-
-	if (p_mesh_arrays[Mesh::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY)
-		index_array = p_mesh_arrays[Mesh::ARRAY_INDEX];
-
-	if (p_mesh_arrays[Mesh::ARRAY_TEX_UV].get_type() == Variant::PACKED_VECTOR2_ARRAY)
-		uv_array = p_mesh_arrays[Mesh::ARRAY_TEX_UV];
-
-	if (p_mesh_arrays[Mesh::ARRAY_BONES].get_type() == Variant::PACKED_INT32_ARRAY)
-		bones_array = p_mesh_arrays[Mesh::ARRAY_BONES];
-
-	if (p_mesh_arrays[Mesh::ARRAY_WEIGHTS].get_type() == Variant::PACKED_FLOAT32_ARRAY)
-		weights_array = p_mesh_arrays[Mesh::ARRAY_WEIGHTS];
+	normal_array = p_mesh_arrays[Mesh::ARRAY_NORMAL];
+	index_array = p_mesh_arrays[Mesh::ARRAY_INDEX];
+	uv_array = p_mesh_arrays[Mesh::ARRAY_TEX_UV];
+	bones_array = p_mesh_arrays[Mesh::ARRAY_BONES];
+	weights_array = p_mesh_arrays[Mesh::ARRAY_WEIGHTS];
 }
 
-void TopologyDataImporter::convert_importer_meshinstance_to_subdiv(Object *importer_mesh_instance_object, ImportMode import_mode, int32_t subdiv_level) {
-	ImporterMeshInstance3D *importer_mesh_instance = Object::cast_to<ImporterMeshInstance3D>(importer_mesh_instance_object);
+void TopologyDataImporter::convert_importer_meshinstance_to_subdiv(ImporterMeshInstance3D *importer_mesh_instance, ImportMode import_mode, int32_t subdiv_level) {
 	Ref<ImporterMesh> importer_mesh = importer_mesh_instance->get_mesh();
 	ERR_FAIL_COND_MSG(importer_mesh.is_null(), "Mesh is null");
 
-	//handle cases that don't need to generate TopologyDataMesh
-	if (subdiv_level == 0) {
-		if (import_mode == ImportMode::IMPORTER_MESH) {
-			return;
-		}
-		if (import_mode == ImportMode::ARRAY_MESH) {
-			_replace_importer_mesh_instance_with_mesh_instance(importer_mesh_instance);
-			return;
-		}
-	}
+	// Always generate to flush out any errors.
 
 	Ref<TopologyDataMesh> topology_data_mesh;
 	topology_data_mesh.instantiate();
@@ -66,7 +52,7 @@ void TopologyDataImporter::convert_importer_meshinstance_to_subdiv(Object *impor
 	for (int surface_index = 0; surface_index < importer_mesh->get_surface_count(); surface_index++) {
 		//convert actual mesh data to quad
 		Array p_arrays = importer_mesh->get_surface_arrays(surface_index);
-		int32_t format = generate_fake_format(p_arrays); //importermesh surface_get_format just returns flags
+		int32_t format = generate_fake_format(p_arrays);
 
 		// generate_fake_format returns 0 if size != ARRAY_MAX
 		if (format == 0 || !(format & Mesh::ARRAY_FORMAT_VERTEX)) {
@@ -83,7 +69,7 @@ void TopologyDataImporter::convert_importer_meshinstance_to_subdiv(Object *impor
 		}
 
 		Array surface_arrays;
-		TopologyDataMesh::TopologyType topology_type = _generate_topology_surface_arrays(SurfaceVertexArrays(p_arrays), format, surface_arrays);
+		int topology_type = _generate_topology_surface_arrays(SurfaceVertexArrays(p_arrays), format, surface_arrays);
 
 		//convert all blend shapes in the exact same way (BlendShapeArrays are also just an Array with the size of ARRAY_MAX and data offsets)
 		Array blend_shape_arrays;
@@ -96,35 +82,16 @@ void TopologyDataImporter::convert_importer_meshinstance_to_subdiv(Object *impor
 		}
 
 		ERR_FAIL_COND(!surface_arrays.size());
-		topology_data_mesh->add_surface(surface_arrays, Dictionary(), topology_data_blend_shape_arrays,
+		topology_data_mesh->add_surface(surface_arrays, topology_data_blend_shape_arrays,
 				importer_mesh->get_surface_material(surface_index), importer_mesh->get_surface_name(surface_index), format, topology_type);
 	}
-	//actually add blendshapes to data
+	//add blendshapes to data
 	for (int blend_shape_idx = 0; blend_shape_idx < importer_mesh->get_blend_shape_count(); blend_shape_idx++) {
 		topology_data_mesh->add_blend_shape_name(importer_mesh->get_blend_shape_name(blend_shape_idx));
 	}
 
 	StringName mesh_instance_name = importer_mesh_instance->get_name();
 	switch (import_mode) {
-		case ImportMode::SUBDIV_MESHINSTANCE: {
-			//creates subdiv mesh instance with topologydatamesh
-			SubdivMeshInstance3D *subdiv_mesh_instance = memnew(SubdivMeshInstance3D);
-			// skin data and such are not changed and will just be applied to generated helper triangle mesh later.
-			subdiv_mesh_instance->set_skeleton_path(importer_mesh_instance->get_skeleton_path());
-			if (!importer_mesh_instance->get_skin().is_null()) {
-				subdiv_mesh_instance->set_skin(importer_mesh_instance->get_skin());
-			}
-			subdiv_mesh_instance->set_transform(importer_mesh_instance->get_transform());
-			subdiv_mesh_instance->set_mesh(topology_data_mesh);
-
-			subdiv_mesh_instance->set_subdiv_level(subdiv_level);
-
-			// replace importermeshinstance in scene
-			importer_mesh_instance->replace_by(subdiv_mesh_instance, false);
-			subdiv_mesh_instance->set_name(mesh_instance_name);
-			memdelete(importer_mesh_instance);
-			break;
-		}
 		case ImportMode::BAKED_SUBDIV_MESH: {
 			Ref<BakedSubdivMesh> subdiv_mesh;
 			subdiv_mesh.instantiate();
@@ -134,21 +101,26 @@ void TopologyDataImporter::convert_importer_meshinstance_to_subdiv(Object *impor
 			subdiv_mesh->set_blend_shape_mode(Mesh::BLEND_SHAPE_MODE_NORMALIZED); //otherwise data would need to be converted
 
 			MeshInstance3D *mesh_instance = Object::cast_to<MeshInstance3D>(_replace_importer_mesh_instance_with_mesh_instance(importer_mesh_instance));
+
+			importer_mesh_instance->replace_by(mesh_instance, false);
+			mesh_instance->set_name(mesh_instance_name);
 			mesh_instance->set_mesh(subdiv_mesh);
 			break;
 		}
-		case ImportMode::ARRAY_MESH:
 		case ImportMode::IMPORTER_MESH: {
 			Ref<ImporterMesh> subdiv_importer_mesh;
 			subdiv_importer_mesh.instantiate();
-
 			Ref<SubdivisionBaker> baker;
 			baker.instantiate();
 			subdiv_importer_mesh = baker->get_importer_mesh(subdiv_importer_mesh, topology_data_mesh, subdiv_level, true);
+			// do not know the correct args
+			//subdiv_importer_mesh->generate_lods(90, 180, Array());
+			// subdiv_importer_mesh-generate_lods()
 			importer_mesh_instance->set_mesh(subdiv_importer_mesh);
-			if (import_mode == ImportMode::ARRAY_MESH) {
-				MeshInstance3D *mesh_instance = Object::cast_to<MeshInstance3D>(_replace_importer_mesh_instance_with_mesh_instance(importer_mesh_instance));
-			}
+			MeshInstance3D *mesh_instance = Object::cast_to<MeshInstance3D>(_replace_importer_mesh_instance_with_mesh_instance(importer_mesh_instance));
+			importer_mesh_instance->replace_by(mesh_instance, false);
+			mesh_instance->set_name(mesh_instance_name);
+			mesh_instance->set_mesh(subdiv_importer_mesh->get_mesh());
 			break;
 		}
 		default:
@@ -157,8 +129,8 @@ void TopologyDataImporter::convert_importer_meshinstance_to_subdiv(Object *impor
 	}
 }
 
-TopologyDataMesh::TopologyType TopologyDataImporter::_generate_topology_surface_arrays(const SurfaceVertexArrays &surface, int32_t format, Array &surface_arrays) {
-	ERR_FAIL_COND_V(!(format & Mesh::ARRAY_FORMAT_INDEX), TopologyDataMesh::TopologyType::QUAD);
+int TopologyDataImporter::_generate_topology_surface_arrays(const SurfaceVertexArrays &surface, int32_t format, Array &surface_arrays) {
+	ERR_FAIL_COND_V(!(format & Mesh::ARRAY_FORMAT_INDEX), TopologyDataMesh::TOPOLOGY_DATA_MESH_QUAD);
 	TopologySurfaceData topology_surface = _remove_duplicate_vertices(surface, format);
 	bool is_quad = _merge_to_quads(topology_surface.index_array, topology_surface.uv_array, format);
 	bool has_uv = format & Mesh::ARRAY_FORMAT_TEX_UV;
@@ -180,9 +152,9 @@ TopologyDataMesh::TopologyType TopologyDataImporter::_generate_topology_surface_
 	}
 
 	if (is_quad) {
-		return TopologyDataMesh::TopologyType::QUAD;
+		return TopologyDataMesh::TOPOLOGY_DATA_MESH_QUAD;
 	} else {
-		return TopologyDataMesh::TopologyType::TRIANGLE;
+		return TopologyDataMesh::TOPOLOGY_DATA_MESH_TRIANGLE;
 	}
 }
 
@@ -223,7 +195,7 @@ TopologyDataImporter::TopologySurfaceData TopologyDataImporter::_remove_duplicat
 			max_index++;
 		}
 
-		// always if uv's exist
+		// always use uvs if they exist
 		if (has_uv) {
 			topology_surface.uv_array.append(surface.uv_array[index]);
 		}
@@ -244,7 +216,7 @@ bool TopologyDataImporter::_merge_to_quads(PackedInt32Array &index_array, Packed
 	PackedInt32Array quad_index_array;
 	PackedVector2Array quad_uv_array;
 	for (int i = 0; i < index_array.size(); i += 6) {
-		// initalize unshared with verts from triangle 1
+		// initialize unshared with verts from triangle 1
 		PackedInt32Array unshared_verts;
 		PackedInt32Array pos_unshared_verts; // array to keep track of index of index in index_array
 		for (int t1 = i; t1 < i + 3; t1++) {
@@ -354,37 +326,44 @@ int32_t TopologyDataImporter::generate_fake_format(const Array &arrays) const {
 	ERR_FAIL_COND_V(arrays[Mesh::ARRAY_VERTEX].get_type() != Variant::PACKED_VECTOR3_ARRAY, 0);
 	int32_t format = Mesh::ARRAY_FORMAT_VERTEX;
 
-	if (arrays[Mesh::ARRAY_NORMAL].get_type() == Variant::PACKED_VECTOR3_ARRAY)
+	if (arrays[Mesh::ARRAY_NORMAL].get_type() == Variant::PACKED_VECTOR3_ARRAY) {
 		format |= Mesh::ARRAY_FORMAT_NORMAL;
-	if (arrays[Mesh::ARRAY_TANGENT].get_type() == Variant::PACKED_FLOAT32_ARRAY)
+	}
+	if (arrays[Mesh::ARRAY_TANGENT].get_type() == Variant::PACKED_FLOAT32_ARRAY || arrays[Mesh::ARRAY_TANGENT].get_type() == Variant::PACKED_FLOAT64_ARRAY) {
 		format |= Mesh::ARRAY_FORMAT_TANGENT;
-	if (arrays[Mesh::ARRAY_COLOR].get_type() == Variant::PACKED_COLOR_ARRAY)
+	}
+	if (arrays[Mesh::ARRAY_COLOR].get_type() == Variant::PACKED_COLOR_ARRAY) {
 		format |= Mesh::ARRAY_FORMAT_COLOR;
-	if (arrays[Mesh::ARRAY_TEX_UV].get_type() == Variant::PACKED_VECTOR2_ARRAY)
+	}
+	if (arrays[Mesh::ARRAY_TEX_UV].get_type() == Variant::PACKED_VECTOR2_ARRAY) {
 		format |= Mesh::ARRAY_FORMAT_TEX_UV;
-	if (arrays[Mesh::ARRAY_TEX_UV2].get_type() == Variant::PACKED_VECTOR2_ARRAY)
+	}
+	if (arrays[Mesh::ARRAY_TEX_UV2].get_type() == Variant::PACKED_VECTOR2_ARRAY) {
 		format |= Mesh::ARRAY_FORMAT_TEX_UV2;
-	if (arrays[Mesh::ARRAY_BONES].get_type() == Variant::PACKED_INT32_ARRAY)
+	}
+	if (arrays[Mesh::ARRAY_BONES].get_type() == Variant::PACKED_INT32_ARRAY || arrays[Mesh::ARRAY_BONES].get_type() == Variant::PACKED_FLOAT32_ARRAY || arrays[Mesh::ARRAY_BONES].get_type() == Variant::PACKED_FLOAT64_ARRAY) {
 		format |= Mesh::ARRAY_FORMAT_BONES;
-	if (arrays[Mesh::ARRAY_WEIGHTS].get_type() == Variant::PACKED_FLOAT32_ARRAY)
+	}
+	if (arrays[Mesh::ARRAY_WEIGHTS].get_type() == Variant::PACKED_FLOAT32_ARRAY || arrays[Mesh::ARRAY_WEIGHTS].get_type() == Variant::PACKED_FLOAT64_ARRAY) {
 		format |= Mesh::ARRAY_FORMAT_WEIGHTS;
-	if (arrays[Mesh::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY)
+	}
+	if (arrays[Mesh::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY) {
 		format |= Mesh::ARRAY_FORMAT_INDEX;
+	}
 
 	//check for custom stuff, probably could extract from flag, but this should work
 	if ((format & Mesh::ARRAY_FORMAT_BONES) && (format & Mesh::ARRAY_FORMAT_WEIGHTS)) {
 		const PackedVector3Array &vertex_array = arrays[Mesh::ARRAY_VERTEX];
 		const PackedFloat32Array &weights_array = arrays[Mesh::ARRAY_WEIGHTS];
-		if (vertex_array.size() * 8 == weights_array.size())
+		if (vertex_array.size() * 8 == weights_array.size()) {
 			format |= Mesh::ARRAY_FLAG_USE_8_BONE_WEIGHTS;
+		}
 	}
 
 	return format;
 }
 
-//need to cast back to MeshInstance after. Actually changes scene and switches importer meshinstance to meshinstance
-Object *TopologyDataImporter::_replace_importer_mesh_instance_with_mesh_instance(Object *importer_mesh_instance_object) {
-	ImporterMeshInstance3D *importer_mesh_instance = Object::cast_to<ImporterMeshInstance3D>(importer_mesh_instance_object);
+MeshInstance3D *TopologyDataImporter::_replace_importer_mesh_instance_with_mesh_instance(ImporterMeshInstance3D *importer_mesh_instance) {
 	MeshInstance3D *mesh_instance = memnew(MeshInstance3D);
 	Ref<ArrayMesh> array_mesh;
 	array_mesh.instantiate();
@@ -399,6 +378,5 @@ Object *TopologyDataImporter::_replace_importer_mesh_instance_with_mesh_instance
 	mesh_instance->set_mesh(array_mesh);
 	importer_mesh_instance->replace_by(mesh_instance, false);
 	mesh_instance->set_name(mesh_instance_name);
-	memdelete(importer_mesh_instance);
 	return mesh_instance;
 }

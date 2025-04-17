@@ -3,10 +3,15 @@
 #include "godot_cpp/classes/global_constants.hpp"
 #include "godot_cpp/classes/ref_counted.hpp"
 #include "godot_cpp/core/binder_common.hpp"
+
 #include "subdivider.hpp"
 
 class TriangleSubdivider : public Subdivider {
 	GDCLASS(TriangleSubdivider, Subdivider);
+
+public:
+	TriangleSubdivider();
+	~TriangleSubdivider();
 
 protected:
 	static void _bind_methods();

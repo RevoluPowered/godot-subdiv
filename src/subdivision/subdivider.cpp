@@ -1,3 +1,33 @@
+/**************************************************************************/
+/*  subdivider.cpp                                                        */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
 #include "subdivider.hpp"
 
 #include "godot_cpp/classes/mesh_data_tool.hpp"
@@ -15,6 +45,12 @@ using namespace OpenSubdiv;
 typedef Far::TopologyDescriptor Descriptor;
 
 Subdivider::TopologyData::TopologyData(const Array &p_mesh_arrays, int32_t p_format, int32_t p_face_verts) {
+	ERR_FAIL_INDEX(TopologyDataMesh::ARRAY_VERTEX, p_mesh_arrays.size());
+	ERR_FAIL_INDEX(TopologyDataMesh::ARRAY_INDEX, p_mesh_arrays.size());
+	ERR_FAIL_INDEX(TopologyDataMesh::ARRAY_UV_INDEX, p_mesh_arrays.size());
+	ERR_FAIL_INDEX(TopologyDataMesh::ARRAY_BONES, p_mesh_arrays.size());
+	ERR_FAIL_INDEX(TopologyDataMesh::ARRAY_WEIGHTS, p_mesh_arrays.size());
+	ERR_FAIL_INDEX(p_mesh_arrays.size(), int(TopologyDataMesh::ARRAY_MAX) + 1);
 	vertex_array = p_mesh_arrays[TopologyDataMesh::ARRAY_VERTEX];
 	index_array = p_mesh_arrays[TopologyDataMesh::ARRAY_INDEX];
 	if (p_format & Mesh::ARRAY_FORMAT_TEX_UV) {
@@ -37,12 +73,12 @@ Subdivider::TopologyData::TopologyData(const Array &p_mesh_arrays, int32_t p_for
 
 struct Vertex {
 	void Clear() { x = y = z = 0; }
-	void AddWithWeight(Vertex const &src, float weight) {
+	void AddWithWeight(Vertex const &src, real_t weight) {
 		x += weight * src.x;
 		y += weight * src.y;
 		z += weight * src.z;
 	}
-	float x, y, z;
+	real_t x, y, z;
 };
 
 struct VertexUV {
@@ -50,29 +86,49 @@ struct VertexUV {
 		u = v = 0.0f;
 	}
 
-	void AddWithWeight(VertexUV const &src, float weight) {
+	void AddWithWeight(VertexUV const &src, real_t weight) {
 		u += weight * src.u;
 		v += weight * src.v;
 	}
 
 	// Basic 'uv' layout channel
-	float u, v;
+	real_t u, v;
+};
+
+struct Bone {
+	int32_t bone_id = -1;
+	float weight = 0.0f;
 };
 
 struct VertexWeights {
 	void Clear() {
 		for (int i = 0; i < weights.size(); i++) {
-			weights[i] = 0;
+			weights.write[i].bone_id = -1;
+			weights.write[i].weight = 0;
 		}
 	}
 
 	void AddWithWeight(VertexWeights const &src, float weight) {
 		for (int i = 0; i < weights.size(); i++) {
-			weights[i] += src.weights[i] * weight;
+			if (src.weights[i].bone_id == weights[i].bone_id) {
+				weights.write[i].weight += src.weights[i].weight * weight;
+				continue;
+			}
+			weights.write[i].weight += src.weights[i].weight * weight / 2.0;
+		}
+		float sum = 0.0f;
+		for (int i = 0; i < weights.size(); i++) {
+			sum += weights[i].weight;
+		}
+		if (sum == 0) {
+			sum = 1;
+		}
+		for (int i = 0; i < weights.size(); i++) {
+			weights.write[i].weight /= sum;
 		}
 	}
 
-	PackedFloat32Array weights;
+	Vector<Bone> weights;
 };
 
 Descriptor Subdivider::_create_topology_descriptor(Vector<int> &subdiv_face_vertex_count, Descriptor::FVarChannel *channels, const int32_t p_format) {
@@ -115,7 +171,9 @@ Far::TopologyRefiner *Subdivider::_create_topology_refiner(const int32_t p_level
 
 	Sdc::SchemeType type = _get_refiner_type();
 	Sdc::Options options;
-	options.SetVtxBoundaryInterpolation(Sdc::Options::VTX_BOUNDARY_EDGE_ONLY);
+	options.SetVtxBoundaryInterpolation(Sdc::Options::VTX_BOUNDARY_EDGE_AND_CORNER);
+	options.SetFVarLinearInterpolation(Sdc::Options::FVAR_LINEAR_CORNERS_PLUS2);
+	options.SetCreasingMethod(Sdc::Options::CREASE_UNIFORM);
 
 	Far::TopologyRefinerFactory<Descriptor>::Options create_options(type, options);
 
@@ -174,7 +232,7 @@ void Subdivider::_create_subdivision_vertices(Far::TopologyRefiner *refiner, con
 		}
 
 		//create array with all weights per vertex
-		Vector<PackedFloat32Array> all_vertex_bone_weights; //will contain all weights per vertex indexed to bones
+		Vector<Vector<Bone>> all_vertex_bone_weights; //will contain all weights per vertex indexed to bones
 		all_vertex_bone_weights.resize(topology_data.vertex_count);
 
 		//resize to fit all weights
@@ -187,7 +245,8 @@ void Subdivider::_create_subdivision_vertices(Far::TopologyRefiner *refiner, con
 			for (int weight_index = 0; weight_index < 4; weight_index++) {
 				if (topology_data.weights_array[vertex_index * 4 + weight_index] != 0.0f) {
 					int bone_index = topology_data.bones_array[vertex_index * 4 + weight_index];
-					all_vertex_bone_weights.write[vertex_index][bone_index] = topology_data.weights_array[vertex_index * 4 + weight_index];
+					all_vertex_bone_weights.write[vertex_index].write[bone_index].bone_id = bone_index;
+					all_vertex_bone_weights.write[vertex_index].write[bone_index].weight = topology_data.weights_array[vertex_index * 4 + weight_index];
 				}
 			}
 		}
@@ -196,7 +255,7 @@ void Subdivider::_create_subdivision_vertices(Far::TopologyRefiner *refiner, con
 		VertexWeights *src_weights = (VertexWeights *)all_vertex_bone_weights.ptrw();
 		for (int level = 0; level < p_level; ++level) {
 			VertexWeights *dst_weights = src_weights + refiner->GetLevel(level).GetNumVertices();
-			primvar_refiner.Interpolate(level + 1, src_weights, dst_weights);
+			primvar_refiner.InterpolateVarying(level + 1, src_weights, dst_weights);
 			src_weights = dst_weights;
 		}
 
@@ -205,14 +264,14 @@ void Subdivider::_create_subdivision_vertices(Far::TopologyRefiner *refiner, con
 		topology_data.weights_array.resize(topology_data.vertex_count * 4);
 		for (int vertex_index = 0; vertex_index < topology_data.vertex_count; vertex_index++) {
 			int weight_indices[4] = { -1, -1, -1, -1 };
-			const PackedFloat32Array &vertex_bones_weights = all_vertex_bone_weights[vertex_index];
+			const Vector<Bone> &vertex_bones_weights = all_vertex_bone_weights[vertex_index];
 
 			for (int weight_index = 0; weight_index <= highest_bone_index; weight_index++) {
-				if (vertex_bones_weights[weight_index] != 0 && (weight_indices[3] == -1 || vertex_bones_weights[weight_index] > vertex_bones_weights[weight_indices[3]])) {
+				if (vertex_bones_weights[weight_index].weight != 0 && (weight_indices[3] == -1 || vertex_bones_weights[weight_index].weight > vertex_bones_weights[weight_indices[3]].weight)) {
 					weight_indices[3] = weight_index;
 					//move to right place, highest weight at position 0
 					for (int i = 2; i >= 0; i--) {
-						if (weight_indices[i] == -1 || vertex_bones_weights[weight_index] > vertex_bones_weights[weight_indices[i]]) {
+						if (weight_indices[i] == -1 || vertex_bones_weights[weight_index].weight > vertex_bones_weights[weight_indices[i]].weight) {
 							//swap
 							weight_indices[i + 1] = weight_indices[i];
 							weight_indices[i] = weight_index;
@@ -230,7 +289,18 @@ void Subdivider::_create_subdivision_vertices(Far::TopologyRefiner *refiner, con
 					topology_data.weights_array[vertex_index * 4 + result_weight_index] = 0;
 				} else {
 					topology_data.bones_array[vertex_index * 4 + result_weight_index] = weight_indices[result_weight_index];
-					topology_data.weights_array[vertex_index * 4 + result_weight_index] = vertex_bones_weights[weight_indices[result_weight_index]];
+					topology_data.weights_array[vertex_index * 4 + result_weight_index] = vertex_bones_weights[weight_indices[result_weight_index]].weight;
+				}
+			}
+		}
+		for (int vertex_index = 0; vertex_index < topology_data.vertex_count; vertex_index++) {
+			float total_weight = 0.0f;
+			for (int weight_index = 0; weight_index < 4; weight_index++) {
+				total_weight += topology_data.weights_array[vertex_index * 4 + weight_index];
+			}
+			for (int weight_index = 0; weight_index < 4; weight_index++) {
+				if (total_weight != 0) {
+					topology_data.weights_array[vertex_index * 4 + weight_index] /= total_weight;
 				}
 			}
 		}
@@ -259,17 +329,13 @@ Array Subdivider::get_subdivided_topology_arrays(const Array &p_arrays, int p_le
 
 void Subdivider::subdivide(const Array &p_arrays, int p_level, int32_t p_format, bool calculate_normals) {
 	ERR_FAIL_COND(p_level < 0);
-	const bool use_uv = p_format & Mesh::ARRAY_FORMAT_TEX_UV;
-	const bool use_bones = (p_format & Mesh::ARRAY_FORMAT_BONES) && (p_format & Mesh::ARRAY_FORMAT_WEIGHTS);
-
 	topology_data = TopologyData(p_arrays, p_format, _get_vertices_per_face_count());
-	//if p_level not 0 subdivide mesh and store in topology_data again
+	//if p_level is not 0 subdivide mesh and store in topology_data again
 	if (p_level != 0) {
 		Far::TopologyRefiner *refiner = _create_topology_refiner(p_level, p_format);
 		ERR_FAIL_COND_MSG(!refiner, "Refiner couldn't be created, numVertsPerFace array likely lost.");
 		_create_subdivision_vertices(refiner, p_level, p_format);
 		_create_subdivision_faces(refiner, p_level, p_format);
-		//free memory
 
 		delete refiner;
 	}
@@ -279,7 +345,6 @@ void Subdivider::subdivide(const Array &p_arrays, int p_level, int32_t p_format,
 	}
 }
 
-//TODO: virtual calls are not implemented yet in godot cpp (I think, it wasnt 2 weeks ago and didn't see any commit)
 OpenSubdiv::Sdc::SchemeType Subdivider::_get_refiner_type() const {
 	return Sdc::SchemeType::SCHEME_CATMARK;
 }
@@ -287,7 +352,6 @@ OpenSubdiv::Sdc::SchemeType Subdivider::_get_refiner_type() const {
 void Subdivider::_create_subdivision_faces(OpenSubdiv::Far::TopologyRefiner *refiner,
 		const int32_t p_level, int32_t p_format) {
 	const bool use_uv = p_format & Mesh::ARRAY_FORMAT_TEX_UV;
-	const bool use_bones = (p_format & Mesh::ARRAY_FORMAT_BONES) && (p_format & Mesh::ARRAY_FORMAT_WEIGHTS);
 
 	PackedInt32Array index_array;
 	PackedInt32Array uv_index_array;
@@ -324,7 +388,7 @@ void Subdivider::_create_subdivision_faces(OpenSubdiv::Far::TopologyRefiner *ref
 	}
 }
 
-PackedVector3Array Subdivider::_calculate_smooth_normals(const PackedVector3Array &quad_vertex_array, const PackedInt32Array &quad_index_array) const {
+PackedVector3Array Subdivider::_calculate_smooth_normals(const PackedVector3Array &quad_vertex_array, const PackedInt32Array &quad_index_array) {
 	PackedVector3Array normals;
 	normals.resize(quad_vertex_array.size());
 	for (int f = 0; f < quad_index_array.size(); f += topology_data.vertex_count_per_face) {
@@ -362,6 +426,11 @@ Array Subdivider::_get_direct_triangle_arrays() const {
 }
 
 void Subdivider::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("get_subdivided_arrays"), &Subdivider::get_subdivided_arrays);
-	ClassDB::bind_method(D_METHOD("get_subdivided_topology_arrays"), &Subdivider::get_subdivided_topology_arrays);
+	ClassDB::bind_method(D_METHOD("get_subdivided_arrays", "arrays", "level", "format", "calculate_normals"), &Subdivider::get_subdivided_arrays);
+	ClassDB::bind_method(D_METHOD("get_subdivided_topology_arrays", "arrays", "level", "format", "calculate_normals"), &Subdivider::get_subdivided_topology_arrays);
+}
+
+Subdivider::Subdivider() {
+}
+Subdivider::~Subdivider() {
 }
